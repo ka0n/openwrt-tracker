@@ -9,7 +9,7 @@ sed -n '/^ha_seen() {/,/^}/p' "$SOURCE" > "$DIR/function.sh"
 . "$DIR/function.sh"
 RUNDIR="$DIR"
 CONFIG="$DIR/config"
-printf '{}\\n' > "$CONFIG"
+printf '{}\n' > "$CONFIG"
 HAS_UCODE=0
 AP_NAME=''
 LOCATION=home
@@ -18,7 +18,7 @@ SOURCE_TYPE=router
 MQTT_RETAIN_STATE=true
 config_attempts=0
 state_attempts=0
-device_slug() { printf '%s\\n' "$1" | tr ':' '_'; }
+device_slug() { printf '%s\n' "$1" | tr ':' '_'; }
 is_registered() { [ -f "$RUNDIR/$1.reg" ]; }
 mark_registered() { touch "$RUNDIR/$1.reg"; }
 jsonfilter() { return 0; }
