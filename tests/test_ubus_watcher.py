@@ -3,6 +3,8 @@ import importlib.util
 from pathlib import Path
 import sys
 import threading
+from queue import Queue
+from types import SimpleNamespace
 import types
 import unittest
 from unittest.mock import patch
@@ -45,6 +47,23 @@ class FakeProcess:
 
 
 class WatcherEOFTest(unittest.TestCase):
+    def test_sync_reconciles_live_only_disassociation(self):
+        mod = load_detector()
+        detector = object.__new__(mod.PresenceDetector)
+        mac = "aa:bb:cc:dd:ee:ff"
+        detector._registered_clients = set()
+        detector._last_seen_clients = set()
+        detector._settings = SimpleNamespace(interfaces=["hostapd.test"], params={})
+        detector._online_clients = {"hostapd.test": {mac}}
+        detector._queue = Queue()
+        detector._get_all_online_devices = lambda: []
+        detector._should_handle_device = lambda device: True
+        detector._do_full_sync()
+        event = detector._queue.get_nowait()
+        self.assertEqual(event.action, mod.QueueItem.Action.DELETE)
+        self.assertEqual(event.device, mac)
+        self.assertEqual(detector._online_clients["hostapd.test"], set())
+
     def test_subscription_restarts_after_eof(self):
         mod = load_detector()
         joined = []
