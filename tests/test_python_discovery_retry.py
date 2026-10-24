@@ -2,6 +2,7 @@
 import importlib.util
 from pathlib import Path
 import sys
+from threading import Lock
 import types
 from types import SimpleNamespace
 import unittest
@@ -30,6 +31,8 @@ class DiscoveryRetryTest(unittest.TestCase):
         mod = load_detector()
         detector = object.__new__(mod.PresenceDetector)
         detector._registered_clients = set()
+        detector._registration_lock = Lock()
+        detector._registration_epoch = 0
         detector._settings = SimpleNamespace(ap_name="", params={}, location="home", away="not_home", source_type="router", mqtt_retain_state=True)
         calls = {"config": 0, "state": 0}
 
@@ -47,6 +50,30 @@ class DiscoveryRetryTest(unittest.TestCase):
         self.assertIn(slug, detector._registered_clients)
         self.assertTrue(detector._ha_seen(mac, seen=False))
         self.assertEqual(calls, {"config": 2, "state": 3})
+
+    def test_reset_during_publish_is_not_cached(self):
+        mod = load_detector()
+        detector = object.__new__(mod.PresenceDetector)
+        detector._registered_clients = set()
+        detector._registration_lock = Lock()
+        detector._registration_epoch = 0
+        detector._settings = SimpleNamespace(ap_name="", params={}, location="home", away="not_home", source_type="router", mqtt_retain_state=True)
+        publications = []
+
+        def publish(topic, payload, retain=False):
+            publications.append(topic)
+            if topic.endswith("/config") and len(publications) == 1:
+                detector._reset_registrations()
+            return True
+
+        detector._publish = publish
+        mac = "aa:bb:cc:dd:ee:ff"
+        slug = "aa_bb_cc_dd_ee_ff"
+        self.assertFalse(detector._ha_seen(mac))
+        self.assertNotIn(slug, detector._registered_clients)
+        self.assertTrue(detector._ha_seen(mac))
+        self.assertIn(slug, detector._registered_clients)
+        self.assertEqual(sum(s.endswith("/config") for s in publications), 2)
 
 
 if __name__ == "__main__":
