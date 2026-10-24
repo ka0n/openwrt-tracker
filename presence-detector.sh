@@ -353,8 +353,14 @@ ha_seen() {
 			# Persist failed discovery even if this device emits no more events.
 			# Use rename so the main loop never sees a half-written file.
 			local retry_file="$RUNDIR/$device_slug.discovery_retry"
-			printf '%s %s\n' "$device" "$seen" > "$retry_file.$" &&
-				mv "$retry_file.$" "$retry_file"
+			local retry_tmp
+			retry_tmp=$(mktemp "$retry_file.XXXXXX") || return 1
+			if printf '%s %s\n' "$device" "$seen" > "$retry_tmp"; then
+				mv "$retry_tmp" "$retry_file"
+			else
+				rm -f "$retry_tmp"
+				return 1
+			fi
 		fi
 	else
 		# Another watcher may already have completed discovery for this MAC.
