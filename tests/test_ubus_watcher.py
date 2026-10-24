@@ -51,14 +51,16 @@ class WatcherEOFTest(unittest.TestCase):
         left = []
         watcher = mod.UbusWatcher("hostapd.wlan0", lambda i, m: joined.append((i, m)), lambda i, m: left.append((i, m)))
         restarted = threading.Event()
+        reconciled = []
+        watcher._on_reconnect = lambda interface: reconciled.append(interface)
         processes = []
 
         def popen(args, **kwargs):
             self.assertEqual(args, ["ubus", "subscribe", "hostapd.wlan0"])
             if processes:
-                watcher.stop()
+                proc = FakeProcess(['{"assoc":{"address":"11:22:33:44:55:66"}}\n'])
                 restarted.set()
-                proc = FakeProcess([])
+                watcher.stop()
             else:
                 proc = FakeProcess(['{"assoc":{"address":"AA:BB:CC:DD:EE:FF"}}\n', '{"disassoc":{"address":"AA:BB:CC:DD:EE:FF"}}\n'])
             processes.append(proc)
@@ -74,6 +76,7 @@ class WatcherEOFTest(unittest.TestCase):
                 thread.join(2)
         self.assertFalse(thread.is_alive())
         self.assertTrue(processes[0].terminated)
+        self.assertEqual(reconciled, ["hostapd.wlan0"])
         self.assertEqual(joined, [("hostapd.wlan0", "aa:bb:cc:dd:ee:ff")])
         self.assertEqual(left, [("hostapd.wlan0", "aa:bb:cc:dd:ee:ff")])
 
