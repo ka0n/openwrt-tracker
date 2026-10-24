@@ -438,6 +438,10 @@ class UbusWatcher(Thread):
             # Startup OK, start reading stdout
             while not self._killed:
                 line = ubus.stdout.readline()
+                if not line:
+                    # EOF: ubus closed the pipe. Exit the read loop so the
+                    # outer loop can restart the event subscription.
+                    break
                 event = {}
                 try:
                     event = json.loads(line)
