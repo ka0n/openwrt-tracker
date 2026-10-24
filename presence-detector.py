@@ -209,7 +209,6 @@ class PresenceDetector(Thread):
 
         ok = True
         if device_slug not in self._registered_clients:
-            self._registered_clients.add(device_slug)
             body = {
                 "state_topic": f"homeassistant/device_tracker/{device_slug}/state",
                 "json_attributes_topic": f"homeassistant/device_tracker/{device_slug}/state",
@@ -226,10 +225,13 @@ class PresenceDetector(Thread):
                 body = Settings.deep_merge(body, self._settings.params[device])
                 if "name" not in body["device"]:
                     body["device"]["name"] = body["name"]
-            # Register the device in HA
-            ok &= self._publish(
+            # Cache discovery only when the broker accepted the publish.
+            discovery_ok = self._publish(
                 f"homeassistant/device_tracker/{device_slug}/config", json.dumps(body)
             )
+            if discovery_ok:
+                self._registered_clients.add(device_slug)
+            ok &= discovery_ok
         # Set the state of the device
         state = {
             "in_zones": [f"zone.{self._settings.location}"] if seen else [],
