@@ -347,7 +347,12 @@ ha_seen() {
 		mqtt_pub "$config_topic" "$body" 1
 		ok=$?
 		# Failed discovery must be retried on the next event or sync.
-		[ "$ok" -eq 0 ] && mark_registered "$device_slug"
+		if [ "$ok" -eq 0 ]; then
+			mark_registered "$device_slug"
+		else
+			# Share failed-discovery state across watcher subshells.
+			touch "$RUNDIR/.discovery_retry"
+		fi
 	fi
 
 	# Publish state
@@ -409,6 +414,8 @@ do_full_sync() {
 	echo "$now" > "$RUNDIR/.last_sync" 2>/dev/null
 
 	reset_registrations
+	# A new failure during this scan will recreate the marker.
+	rm -f "$RUNDIR/.discovery_retry"
 	local seen_file="$RUNDIR/.seen_now"
 	get_all_online_devices | sort -u > "$seen_file"
 
@@ -705,9 +712,18 @@ main() {
 	# depending on a SIGTERM trap interrupting a long `sleep` (unreliable on
 	# busybox ash), and well within procd's term_timeout.
 	local elapsed=0
+	local retry_elapsed=0
 	while [ ! -f "$RUNDIR/.stop" ]; do
 		sleep 2
 		[ -f "$RUNDIR/.stop" ] && break
+		retry_elapsed=$((retry_elapsed + 2))
+		if [ "$retry_elapsed" -ge 30 ]; then
+			retry_elapsed=0
+			if [ -f "$RUNDIR/.discovery_retry" ]; then
+				log "Retrying failed MQTT discovery registrations"
+				do_full_sync 1
+			fi
+		fi
 		if [ "$AWAY_DEBOUNCE_SECONDS" -gt 0 ] 2>/dev/null; then
 			process_pending_away
 		fi
