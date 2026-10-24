@@ -108,6 +108,7 @@ class QueueItem:
         ADD = 1
         DELETE = 2
         QUIT = 3
+        SYNC = 4
 
     device: str
     interface: str
@@ -294,6 +295,11 @@ class PresenceDetector(Thread):
             return not self._settings.filter_is_denylist
         return self._settings.filter_is_denylist
 
+    def _request_reconciliation(self, interface: str) -> None:
+        """Reconcile missed Wi-Fi events on the detector thread."""
+        self._logger.log(f"ubus subscription restored on {interface}; syncing clients")
+        self._queue.put(QueueItem("", interface, QueueItem.Action.SYNC))
+
     def start_watchers(self) -> None:
         """Start ubus watcher threads for every interface"""
         self._logger.log(
@@ -301,7 +307,10 @@ class PresenceDetector(Thread):
         )
         for interface in self._settings.interfaces:
             # Start an ubus watcher for every interface
-            watcher = UbusWatcher(interface, self.set_device_home, self.set_device_away)
+            watcher = UbusWatcher(
+                interface, self.set_device_home, self.set_device_away,
+                self._request_reconciliation,
+            )
             watcher.start()
             self._watchers.append(watcher)
 
@@ -329,7 +338,14 @@ class PresenceDetector(Thread):
         self._registered_clients = set()
         seen_now = set(self._get_all_online_devices())
         is_first_sync = self._last_seen_clients is None
-        away = (self._last_seen_clients or set()) - seen_now
+        # Live events since the last snapshot must also be reconciled:
+        # otherwise a missed disassoc leaves an event-only device at home.
+        tracked = (self._last_seen_clients or set()) | {
+            (interface, device)
+            for interface, clients in self._online_clients.items()
+            for device in clients
+        }
+        away = tracked - seen_now
         self._last_seen_clients = seen_now
         for interface, client in seen_now:
             if not away_only:
@@ -379,6 +395,11 @@ class PresenceDetector(Thread):
                 self._do_full_sync()
                 continue
 
+            if item.action == QueueItem.Action.SYNC:
+                self._do_full_sync()
+                self._queue.task_done()
+                continue
+
             if item.action == QueueItem.Action.QUIT:
                 self._queue.task_done()
                 break
@@ -407,10 +428,12 @@ class UbusWatcher(Thread):
         interface: str,
         on_join: Callable[[str, str], None],
         on_leave: Callable[[str, str], None],
+        on_reconnect: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__()
         self._on_join = on_join
         self._on_leave = on_leave
+        self._on_reconnect = on_reconnect
         self._interface = interface
         self._killed = False
 
@@ -420,6 +443,8 @@ class UbusWatcher(Thread):
 
     def run(self) -> None:
         """Main loop for the ubus event watcher thread"""
+        reconnect_pending = False
+        next_warning = 0.0
         while not self._killed:
             # pylint: disable=consider-using-with
             ubus = subprocess.Popen(
@@ -435,12 +460,22 @@ class UbusWatcher(Thread):
                 # Starting ubus failed -> interface does not exist (yet)? let's retry later
                 ubus.wait()
                 continue
+            # Snapshot only once the replacement subscription is live.
+            if reconnect_pending and not self._killed and self._on_reconnect:
+                self._on_reconnect(self._interface)
+            reconnect_pending = False
             # Startup OK, start reading stdout
             while not self._killed:
                 line = ubus.stdout.readline()
                 if not line:
-                    # EOF: ubus closed the pipe. Exit the read loop so the
-                    # outer loop can restart the event subscription.
+                    # EOF: resubscribe and reconcile events lost in the gap.
+                    reconnect_pending = True
+                    now = time.monotonic()
+                    if now >= next_warning:
+                        Logger(False).log(
+                            f"ubus subscribe {self._interface} ended; retrying"
+                        )
+                        next_warning = now + 60
                     break
                 event = {}
                 try:
@@ -456,6 +491,8 @@ class UbusWatcher(Thread):
                     )
             ubus.terminate()
             ubus.wait()
+            if reconnect_pending and not self._killed:
+                time.sleep(2)
 
 
 def main():
