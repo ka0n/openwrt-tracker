@@ -355,7 +355,10 @@ class PresenceDetector(Thread):
                 # is keyed by real interface names and is only meaningful
                 # for devices that were actually observed on one, which by
                 # definition isn't the case here.
-                self._ha_seen(device, seen=False)
+                if not self._ha_seen(device, seen=False):
+                    # Offline configured devices receive no association events.
+                    # Retry failed discovery through the normal MQTT queue.
+                    self._queue.put(QueueItem(device, "", QueueItem.Action.DELETE))
 
     def run(self) -> None:
         """Main loop for the presence detector"""
