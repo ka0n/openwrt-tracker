@@ -56,6 +56,7 @@ class WatcherEOFTest(unittest.TestCase):
         detector._settings = SimpleNamespace(interfaces=["hostapd.test"], params={})
         detector._online_clients = {"hostapd.test": {mac}}
         detector._queue = Queue()
+        detector._logger = SimpleNamespace(log=lambda *args, **kwargs: None)
         detector._get_all_online_devices = lambda: []
         detector._should_handle_device = lambda device: True
         detector._do_full_sync()
