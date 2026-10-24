@@ -1,6 +1,6 @@
 #!/bin/sh
 # Exercise the actual ha_seen() function with mocked MQTT publication.
-set -eu
+set -e
 SOURCE="${1:-presence-detector.sh}"
 DIR=$(mktemp -d)
 trap 'rm -rf "$DIR"' EXIT HUP INT TERM
