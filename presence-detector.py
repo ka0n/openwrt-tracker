@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from enum import IntEnum
 from queue import Queue
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, Callable
 
 from paho.mqtt import client as mqtt
@@ -127,6 +127,8 @@ class PresenceDetector(Thread):
         self._last_seen_clients: set[tuple[str, str]] | None = None
         self._online_clients: dict[str, set[str]] = {}
         self._registered_clients: set[str] = set()
+        self._registration_lock = Lock()
+        self._registration_epoch = 0
         for interface in self._settings.interfaces:
             self._online_clients[interface] = set()
         self._connect_to_mqtt()
@@ -174,17 +176,23 @@ class PresenceDetector(Thread):
         """Callback for MQTT connection failures"""
         self._logger.log("MQTT broker connection failed, retrying...")
 
+    def _reset_registrations(self) -> None:
+        """Invalidate in-flight discovery publishes as well as cached slugs."""
+        with self._registration_lock:
+            self._registration_epoch += 1
+            self._registered_clients.clear()
+
     def _on_mqtt_disconnect(self, *args, **_kwargs):
         """Callback for MQTT disconnections (supports both v1 and v2 API)"""
         reason_code = args[3] if len(args) >= 4 else (args[2] if len(args) >= 3 else 0)
         self._logger.log(f"MQTT broker disconnected (rc: {reason_code})")
-        self._registered_clients.clear()
+        self._reset_registrations()
 
     def _on_ha_status_message(self, _client, _userdata, message):
         """Callback for HA status messages"""
         if message.payload == b"offline":
             self._logger.log("Home Assistant is offline!")
-            self._registered_clients.clear()
+            self._reset_registrations()
         elif message.payload == b"online":
             self._logger.log("Home Assistant is back online")
             self._do_full_sync()
@@ -208,7 +216,10 @@ class PresenceDetector(Thread):
             device_slug = f"{self._settings.ap_name}_{device_slug}"
 
         ok = True
-        if device_slug not in self._registered_clients:
+        with self._registration_lock:
+            needs_discovery = device_slug not in self._registered_clients
+            publish_epoch = self._registration_epoch
+        if needs_discovery:
             body = {
                 "state_topic": f"homeassistant/device_tracker/{device_slug}/state",
                 "json_attributes_topic": f"homeassistant/device_tracker/{device_slug}/state",
@@ -230,7 +241,13 @@ class PresenceDetector(Thread):
                 f"homeassistant/device_tracker/{device_slug}/config", json.dumps(body)
             )
             if discovery_ok:
-                self._registered_clients.add(device_slug)
+                with self._registration_lock:
+                    if publish_epoch == self._registration_epoch:
+                        self._registered_clients.add(device_slug)
+                    else:
+                        # A disconnect or resync invalidated this publish.
+                        # Return failure so the normal queue retries discovery.
+                        discovery_ok = False
             ok &= discovery_ok
         # Set the state of the device
         state = {
@@ -328,7 +345,7 @@ class PresenceDetector(Thread):
 
     def _do_full_sync(self, away_only=False):
         """Perform a full sync of all current online devices compared to last time"""
-        self._registered_clients = set()
+        self._reset_registrations()
         seen_now = set(self._get_all_online_devices())
         is_first_sync = self._last_seen_clients is None
         away = (self._last_seen_clients or set()) - seen_now
