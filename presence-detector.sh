@@ -258,10 +258,12 @@ device_slug() {
 # ---------------------------------------------------------------------------
 
 # Publish the discovery config + state for a device.
-# ha_seen <device-mac> <seen: 1|0>
+# ha_seen <device-mac> <seen: 1|0> [discovery-only: 1]
+# Idle retries must not replay an obsolete presence state after a newer event.
 ha_seen() {
 	local device="$1"
 	local seen="$2"
+	local discovery_only="${3:-0}"
 
 	local device_name
 	local device_slug
@@ -367,6 +369,9 @@ ha_seen() {
 		rm -f "$RUNDIR/$device_slug.discovery_retry"
 	fi
 
+	# A retry repairs discovery only; live events own presence state.
+	[ "$discovery_only" = "1" ] && return "$ok"
+
 	# Publish state
 	local state_topic="homeassistant/device_tracker/${device_slug}/state"
 	local state_payload
@@ -397,7 +402,7 @@ retry_failed_discoveries() {
 		[ -f "$retry_file" ] || continue
 		read -r mac seen < "$retry_file" || continue
 		case "$seen" in
-		0|1) ha_seen "$mac" "$seen" || : ;;
+		0|1) ha_seen "$mac" "$seen" 1 || : ;;
 		*) rm -f "$retry_file" ;;
 		esac
 	done
