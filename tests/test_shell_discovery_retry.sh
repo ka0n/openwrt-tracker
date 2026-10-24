@@ -38,7 +38,9 @@ slug='aa_bb_cc_dd_ee_ff'
 if ha_seen "$mac" 1; then echo 'First config publish should fail' >&2; exit 1; fi
 if is_registered "$slug"; then echo 'Failed discovery cached' >&2; exit 1; fi
 [ -f "$RUNDIR/$slug.discovery_retry" ] || { echo 'Missing idle retry marker' >&2; exit 1; }
-ha_seen "$mac" 1
+sed -n "/^retry_failed_discoveries() {/,/^}/p" "$SOURCE" > "$DIR/retry_function.sh"
+. "$DIR/retry_function.sh"
+retry_failed_discoveries
 [ "$config_attempts" -eq 2 ] || exit 1
 is_registered "$slug" || exit 1
 ha_seen "$mac" 0
