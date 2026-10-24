@@ -16,10 +16,11 @@ def load_detector():
     client = types.ModuleType("paho.mqtt.client")
     paho.mqtt = pkg
     pkg.client = client
-    with patch.dict(sys.modules, {"paho": paho, "paho.mqtt": pkg, "paho.mqtt.client": client}):
+    with patch.dict(sys.modules, {"paho": paho, "paho.mqtt": pkg, "paho.mqtt.client": client, "tracker_eof_test": module}):
         path = Path(__file__).resolve().parents[1] / "presence-detector.py"
         spec = importlib.util.spec_from_file_location("tracker_eof_test", path)
         module = importlib.util.module_from_spec(spec)
+        sys.modules["tracker_eof_test"] = module
         spec.loader.exec_module(module)
     return module
 
