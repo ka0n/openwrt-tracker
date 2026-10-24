@@ -250,6 +250,11 @@ class PresenceDetector(Thread):
                         discovery_ok = False
             ok &= discovery_ok
         # Set the state of the device
+        with self._registration_lock:
+            if publish_epoch != self._registration_epoch:
+                # A cached registration may have been cleared while this call
+                # was in progress; force discovery on the next queue retry.
+                return False
         state = {
             "in_zones": [f"zone.{self._settings.location}"] if seen else [],
             "state": self._settings.location if seen else self._settings.away,
