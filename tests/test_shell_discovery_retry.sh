@@ -41,6 +41,8 @@ if is_registered "$slug"; then echo 'Failed discovery cached' >&2; exit 1; fi
 sed -n "/^retry_failed_discoveries() {/,/^}/p" "$SOURCE" > "$DIR/retry_function.sh"
 . "$DIR/retry_function.sh"
 retry_failed_discoveries
+# The idle retry must not replay the stale home state.
+[ "$state_attempts" -eq 1 ] || { echo "Idle retry replayed presence state" >&2; exit 1; }
 # Concurrent failures must not leave partial or temporary retry files.
 [ ! -e "$RUNDIR/$slug.discovery_retry" ] || exit 1
 for tmp in "$RUNDIR"/*.discovery_retry.*; do
@@ -50,5 +52,5 @@ done
 is_registered "$slug" || exit 1
 ha_seen "$mac" 0
 [ "$config_attempts" -eq 2 ] || exit 1
-[ "$state_attempts" -eq 3 ] || exit 1
+[ "$state_attempts" -eq 2 ] || exit 1
 echo 'PASS: shell discovery retry'
