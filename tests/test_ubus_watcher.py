@@ -60,7 +60,7 @@ class WatcherEOFTest(unittest.TestCase):
                 restarted.set()
                 proc = FakeProcess([])
             else:
-                proc = FakeProcess(['{"assoc":{"address":"AA:BB:CC:DD:EE:FF"}}\\n', '{"disassoc":{"address":"AA:BB:CC:DD:EE:FF"}}\\n'])
+                proc = FakeProcess(['{"assoc":{"address":"AA:BB:CC:DD:EE:FF"}}\n', '{"disassoc":{"address":"AA:BB:CC:DD:EE:FF"}}\n'])
             processes.append(proc)
             return proc
 
