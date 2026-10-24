@@ -51,6 +51,28 @@ class DiscoveryRetryTest(unittest.TestCase):
         self.assertTrue(detector._ha_seen(mac, seen=False))
         self.assertEqual(calls, {"config": 2, "state": 3})
 
+    def test_cached_registration_invalidated_during_state_call(self):
+        mod = load_detector()
+        detector = object.__new__(mod.PresenceDetector)
+        detector._registered_clients = {"aa_bb_cc_dd_ee_ff"}
+        detector._registration_lock = Lock()
+        detector._registration_epoch = 0
+        detector._settings = SimpleNamespace(ap_name="", params={}, location="home", away="not_home", source_type="router", mqtt_retain_state=True)
+        publications = []
+
+        class ResetOnContains(set):
+            def __contains__(self, value):
+                result = super().__contains__(value)
+                detector._reset_registrations()
+                return result
+
+        detector._registered_clients = ResetOnContains(detector._registered_clients)
+        detector._publish = lambda topic, payload, retain=False: publications.append(topic) or True
+        self.assertFalse(detector._ha_seen("aa:bb:cc:dd:ee:ff"))
+        self.assertEqual(publications, [])
+        self.assertTrue(detector._ha_seen("aa:bb:cc:dd:ee:ff"))
+        self.assertTrue(any(topic.endswith("/config") for topic in publications))
+
     def test_reset_during_publish_is_not_cached(self):
         mod = load_detector()
         detector = object.__new__(mod.PresenceDetector)
