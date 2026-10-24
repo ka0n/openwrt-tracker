@@ -1,0 +1,32 @@
+name: Regression tests
+
+on:
+  push:
+    branches:
+      - 'fix/**'
+  pull_request:
+    branches:
+      - 'upstream-main-*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Python syntax and unit tests
+        run: |
+          python -m compileall -q presence-detector.py tests
+          python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Shell syntax and unit tests
+        run: |
+          sh -n presence-detector.sh
+          if [ -f tests/test_shell_discovery_retry.sh ]; then
+            sh tests/test_shell_discovery_retry.sh presence-detector.sh
+          fi
