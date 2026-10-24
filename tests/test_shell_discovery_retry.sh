@@ -37,6 +37,7 @@ mac='aa:bb:cc:dd:ee:ff'
 slug='aa_bb_cc_dd_ee_ff'
 if ha_seen "$mac" 1; then echo 'First config publish should fail' >&2; exit 1; fi
 if is_registered "$slug"; then echo 'Failed discovery cached' >&2; exit 1; fi
+[ -f "$RUNDIR/.discovery_retry" ] || { echo 'Missing idle retry marker' >&2; exit 1; }
 ha_seen "$mac" 1
 [ "$config_attempts" -eq 2 ] || exit 1
 is_registered "$slug" || exit 1
