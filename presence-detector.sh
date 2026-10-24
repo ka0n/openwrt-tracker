@@ -271,8 +271,6 @@ ha_seen() {
 	local ok=0
 
 	if ! is_registered "$device_slug"; then
-		mark_registered "$device_slug"
-
 		local config_topic="homeassistant/device_tracker/${device_slug}/config"
 		local state_topic="homeassistant/device_tracker/${device_slug}/state"
 		local body
@@ -348,6 +346,8 @@ ha_seen() {
 		# own reconnect.
 		mqtt_pub "$config_topic" "$body" 1
 		ok=$?
+		# Failed discovery must be retried on the next event or sync.
+		[ "$ok" -eq 0 ] && mark_registered "$device_slug"
 	fi
 
 	# Publish state
