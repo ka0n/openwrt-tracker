@@ -41,6 +41,11 @@ if is_registered "$slug"; then echo 'Failed discovery cached' >&2; exit 1; fi
 sed -n "/^retry_failed_discoveries() {/,/^}/p" "$SOURCE" > "$DIR/retry_function.sh"
 . "$DIR/retry_function.sh"
 retry_failed_discoveries
+# Concurrent failures must not leave partial or temporary retry files.
+[ ! -e "$RUNDIR/$slug.discovery_retry" ] || exit 1
+for tmp in "$RUNDIR"/*.discovery_retry.*; do
+    [ ! -e "$tmp" ] || { echo "Leaked temporary retry file" >&2; exit 1; }
+done
 [ "$config_attempts" -eq 2 ] || exit 1
 is_registered "$slug" || exit 1
 ha_seen "$mac" 0
