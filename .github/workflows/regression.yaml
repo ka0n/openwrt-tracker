@@ -34,7 +34,10 @@ jobs:
           python -m unittest discover -s tests -p 'test_*.py' -v
       - name: Upstream Python style and typing checks
         run: |
-          black --check presence-detector.py
+          black --diff --check presence-detector.py
+      - name: Upstream pylint and mypy diagnostics
+        if: always()
+        run: |
           pylint presence-detector.py
           mypy presence-detector.py
       - name: Shell syntax and unit tests
