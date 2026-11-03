@@ -1,5 +1,4 @@
 """Integration test: actual MQTT broker restart and discovery retry (CI only)."""
-import getpass
 import importlib.util
 import json
 from pathlib import Path
@@ -40,14 +39,6 @@ class RealBrokerRecoveryTest(unittest.TestCase):
             with socket.socket() as sock:
                 sock.bind(("127.0.0.1", 0))
                 port = sock.getsockname()[1]
-            broker_conf = root / "mosquitto.conf"
-            broker_conf.write_text(
-                f"user {getpass.getuser()}\nlistener {port} 127.0.0.1\n"
-                "allow_anonymous true\npersistence false\n"
-                "log_dest stderr\n",
-                encoding="utf-8",
-            )
-            broker_conf.chmod(0o644)
             broker = None
             detector = None
             observer = None
@@ -55,7 +46,7 @@ class RealBrokerRecoveryTest(unittest.TestCase):
             try:
                 def launch_broker():
                     p = subprocess.Popen(
-                        ["mosquitto", "-c", str(broker_conf)],
+                        ["mosquitto", "-p", str(port)],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.PIPE,
                     )
