@@ -114,6 +114,7 @@ class QueueItem:
     device: str
     interface: str
     action: Action
+    revision: int = 0
 
 
 class PresenceDetector(Thread):
@@ -131,6 +132,9 @@ class PresenceDetector(Thread):
         self._registered_clients: set[str] = set()
         self._registration_lock = Lock()
         self._registration_epoch = 0
+        # The most recently enqueued presence event wins after MQTT retries.
+        self._presence_revision: dict[str, int] = {}
+        self._presence_lock = Lock()
         for interface in self._settings.interfaces:
             self._online_clients[interface] = set()
         self._connect_to_mqtt()
@@ -270,6 +274,18 @@ class PresenceDetector(Thread):
         )
         return ok
 
+    def _queue_presence(self, device: str, interface: str, action: QueueItem.Action) -> None:
+        """Enqueue a presence change, superseding older events for this MAC."""
+        with self._presence_lock:
+            revision = self._presence_revision.get(device, 0) + 1
+            self._presence_revision[device] = revision
+            self._queue.put(QueueItem(device, interface, action, revision))
+
+    def _is_current_presence(self, item: QueueItem) -> bool:
+        """Discard retry backlog entries superseded by a newer event."""
+        with self._presence_lock:
+            return self._presence_revision.get(item.device) == item.revision
+
     def set_device_away(self, interface: str, device: str) -> None:
         """Mark a client as away in HA"""
         if not self._should_handle_device(device):
@@ -284,14 +300,14 @@ class PresenceDetector(Thread):
                     True,
                 )
                 return
-        self._queue.put(QueueItem(device, interface, QueueItem.Action.DELETE))
+        self._queue_presence(device, interface, QueueItem.Action.DELETE)
         self._logger.log(f"Device {device} on {interface} is now away")
 
     def set_device_home(self, interface: str, device: str) -> None:
         """Add client to the 'add' queue"""
         if not self._should_handle_device(device):
             return
-        self._queue.put(QueueItem(device, interface, QueueItem.Action.ADD))
+        self._queue_presence(device, interface, QueueItem.Action.ADD)
         self._online_clients[interface].add(device)
         self._logger.log(
             f"Device {device} on {interface} is now at {self._settings.location}"
@@ -384,7 +400,7 @@ class PresenceDetector(Thread):
                 if not self._ha_seen(device, seen=False):
                     # Offline configured devices receive no association events.
                     # Retry failed discovery through the normal MQTT queue.
-                    self._queue.put(QueueItem(device, "", QueueItem.Action.DELETE))
+                    self._queue_presence(device, "", QueueItem.Action.DELETE)
 
     def run(self) -> None:
         """Main loop for the presence detector"""
@@ -416,6 +432,12 @@ class PresenceDetector(Thread):
 
             if item.action == QueueItem.Action.SYNC:
                 self._do_full_sync()
+                self._queue.task_done()
+                continue
+
+            if not self._is_current_presence(item):
+                # An older failed publish must never overwrite the current
+                # retained MQTT state after a newer event has arrived.
                 self._queue.task_done()
                 continue
 
