@@ -35,6 +35,8 @@ class RealBrokerRecoveryTest(unittest.TestCase):
     def test_broker_outage_retries_discovery_and_state(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
+            # Mosquitto drops privileges before reading its configuration.
+            root.chmod(0o755)
             with socket.socket() as sock:
                 sock.bind(("127.0.0.1", 0))
                 port = sock.getsockname()[1]
