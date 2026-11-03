@@ -274,7 +274,9 @@ class PresenceDetector(Thread):
         )
         return ok
 
-    def _queue_presence(self, device: str, interface: str, action: QueueItem.Action) -> None:
+    def _queue_presence(
+        self, device: str, interface: str, action: QueueItem.Action
+    ) -> None:
         """Enqueue a presence change, superseding older events for this MAC."""
         with self._presence_lock:
             revision = self._presence_revision.get(device, 0) + 1
