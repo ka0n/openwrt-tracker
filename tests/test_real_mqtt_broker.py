@@ -1,4 +1,5 @@
 """Integration test: actual MQTT broker restart and discovery retry (CI only)."""
+import getpass
 import importlib.util
 import json
 from pathlib import Path
@@ -39,7 +40,8 @@ class RealBrokerRecoveryTest(unittest.TestCase):
                 port = sock.getsockname()[1]
             broker_conf = root / "mosquitto.conf"
             broker_conf.write_text(
-                f"listener {port} 127.0.0.1\nallow_anonymous true\npersistence false\n"
+                f"user {getpass.getuser()}\nlistener {port} 127.0.0.1\n"
+                "allow_anonymous true\npersistence false\n"
                 "log_dest stderr\n",
                 encoding="utf-8",
             )
@@ -52,11 +54,14 @@ class RealBrokerRecoveryTest(unittest.TestCase):
                     p = subprocess.Popen(
                         ["mosquitto", "-c", str(broker_conf)],
                         stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
                     )
                     def accepts_connections():
                         if p.poll() is not None:
-                            raise AssertionError("mosquitto exited unexpectedly")
+                            raise AssertionError(
+                                "mosquitto exited unexpectedly: "
+                                + p.stderr.read().decode("utf-8", errors="replace")
+                            )
                         with socket.socket() as sock:
                             return sock.connect_ex(("127.0.0.1", port)) == 0
                     wait_for(accepts_connections)
