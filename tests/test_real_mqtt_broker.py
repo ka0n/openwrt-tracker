@@ -47,6 +47,7 @@ class RealBrokerRecoveryTest(unittest.TestCase):
                 "log_dest stderr\n",
                 encoding="utf-8",
             )
+            broker_conf.chmod(0o644)
             broker = None
             detector = None
             observer = None
