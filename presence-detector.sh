@@ -258,10 +258,12 @@ device_slug() {
 # ---------------------------------------------------------------------------
 
 # Publish the discovery config + state for a device.
-# ha_seen <device-mac> <seen: 1|0>
+# ha_seen <device-mac> <seen: 1|0> [discovery-only: 1]
+# Idle retries must not replay an obsolete presence state after a newer event.
 ha_seen() {
 	local device="$1"
 	local seen="$2"
+	local discovery_only="${3:-0}"
 
 	local device_name
 	local device_slug
@@ -271,8 +273,6 @@ ha_seen() {
 	local ok=0
 
 	if ! is_registered "$device_slug"; then
-		mark_registered "$device_slug"
-
 		local config_topic="homeassistant/device_tracker/${device_slug}/config"
 		local state_topic="homeassistant/device_tracker/${device_slug}/state"
 		local body
@@ -348,7 +348,29 @@ ha_seen() {
 		# own reconnect.
 		mqtt_pub "$config_topic" "$body" 1
 		ok=$?
+		if [ "$ok" -eq 0 ]; then
+			mark_registered "$device_slug"
+			rm -f "$RUNDIR/$device_slug.discovery_retry"
+		else
+			# Persist failed discovery even if this device emits no more events.
+			# Use rename so the main loop never sees a half-written file.
+			local retry_file="$RUNDIR/$device_slug.discovery_retry"
+			local retry_tmp
+			retry_tmp=$(mktemp "$retry_file.XXXXXX") || return 1
+			if printf '%s %s\n' "$device" "$seen" > "$retry_tmp"; then
+				mv "$retry_tmp" "$retry_file"
+			else
+				rm -f "$retry_tmp"
+				return 1
+			fi
+		fi
+	else
+		# Another watcher may already have completed discovery for this MAC.
+		rm -f "$RUNDIR/$device_slug.discovery_retry"
 	fi
+
+	# A retry repairs discovery only; live events own presence state.
+	[ "$discovery_only" = "1" ] && return "$ok"
 
 	# Publish state
 	local state_topic="homeassistant/device_tracker/${device_slug}/state"
@@ -365,6 +387,25 @@ ha_seen() {
 	ok=$((ok + $?))
 
 	return $ok
+}
+
+# ---------------------------------------------------------------------------
+# Idle discovery retry
+# ---------------------------------------------------------------------------
+
+retry_failed_discoveries() {
+	# Called by main every 30s, even with fallback_sync_interval=0.
+	# Retry the failed device directly, including named offline devices;
+	# a full sync alone could omit previously seen but now-away clients.
+	local retry_file mac seen
+	for retry_file in "$RUNDIR"/*.discovery_retry; do
+		[ -f "$retry_file" ] || continue
+		read -r mac seen < "$retry_file" || continue
+		case "$seen" in
+		0|1) ha_seen "$mac" "$seen" 1 || : ;;
+		*) rm -f "$retry_file" ;;
+		esac
+	done
 }
 
 # ---------------------------------------------------------------------------
@@ -670,6 +711,9 @@ main() {
 	# .debounce_pids is from older versions that backgrounded a sleep per
 	# disassoc.
 	rm -f "$RUNDIR"/*.pending_away "$RUNDIR"/*.pending_away.* "$RUNDIR/.debounce_pids" 2>/dev/null
+	# Failed publications from a killed instance cannot be trusted; startup
+	# full sync recreates retry markers for any new failures.
+	rm -f "$RUNDIR"/*.discovery_retry "$RUNDIR"/*.discovery_retry.* 2>/dev/null
 	reset_registrations
 	trap cleanup TERM INT
 
@@ -705,9 +749,15 @@ main() {
 	# depending on a SIGTERM trap interrupting a long `sleep` (unreliable on
 	# busybox ash), and well within procd's term_timeout.
 	local elapsed=0
+	local retry_elapsed=0
 	while [ ! -f "$RUNDIR/.stop" ]; do
 		sleep 2
 		[ -f "$RUNDIR/.stop" ] && break
+		retry_elapsed=$((retry_elapsed + 2))
+		if [ "$retry_elapsed" -ge 30 ]; then
+			retry_elapsed=0
+			retry_failed_discoveries
+		fi
 		if [ "$AWAY_DEBOUNCE_SECONDS" -gt 0 ] 2>/dev/null; then
 			process_pending_away
 		fi
