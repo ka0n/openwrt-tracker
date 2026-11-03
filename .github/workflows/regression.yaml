@@ -20,18 +20,23 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.14'
       - name: Install MQTT integration test dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq mosquitto
-          python -m pip install -r requirements.txt
+          python -m pip install -r requirements-dev.txt
       - name: Real MQTT broker restart integration test
         run: python -m unittest discover -s tests -p 'test_real_mqtt_broker.py' -v
       - name: Python syntax and unit tests
         run: |
           python -m compileall -q presence-detector.py tests
           python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Upstream Python style and typing checks
+        run: |
+          black --check presence-detector.py
+          pylint presence-detector.py
+          mypy presence-detector.py
       - name: Shell syntax and unit tests
         run: |
           sh -n presence-detector.sh
