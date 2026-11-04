@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass
 from enum import IntEnum
 from queue import Queue
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, Callable
 
 from paho.mqtt import client as mqtt
@@ -114,6 +114,7 @@ class QueueItem:
     device: str
     interface: str
     action: Action
+    revision: int = 0
 
 
 class PresenceDetector(Thread):
@@ -129,6 +130,11 @@ class PresenceDetector(Thread):
         self._last_seen_clients: set[tuple[str, str]] | None = None
         self._online_clients: dict[str, set[str]] = {}
         self._registered_clients: set[str] = set()
+        self._registration_lock = Lock()
+        self._registration_epoch = 0
+        # The most recently enqueued presence event wins after MQTT retries.
+        self._presence_revision: dict[str, int] = {}
+        self._presence_lock = Lock()
         for interface in self._settings.interfaces:
             self._online_clients[interface] = set()
         self._connect_to_mqtt()
@@ -176,17 +182,23 @@ class PresenceDetector(Thread):
         """Callback for MQTT connection failures"""
         self._logger.log("MQTT broker connection failed, retrying...")
 
+    def _reset_registrations(self) -> None:
+        """Invalidate in-flight discovery publishes as well as cached slugs."""
+        with self._registration_lock:
+            self._registration_epoch += 1
+            self._registered_clients.clear()
+
     def _on_mqtt_disconnect(self, *args, **_kwargs):
         """Callback for MQTT disconnections (supports both v1 and v2 API)"""
         reason_code = args[3] if len(args) >= 4 else (args[2] if len(args) >= 3 else 0)
         self._logger.log(f"MQTT broker disconnected (rc: {reason_code})")
-        self._registered_clients.clear()
+        self._reset_registrations()
 
     def _on_ha_status_message(self, _client, _userdata, message):
         """Callback for HA status messages"""
         if message.payload == b"offline":
             self._logger.log("Home Assistant is offline!")
-            self._registered_clients.clear()
+            self._reset_registrations()
         elif message.payload == b"online":
             self._logger.log("Home Assistant is back online")
             # Don't sync here: this runs in paho's network thread, and an
@@ -212,8 +224,10 @@ class PresenceDetector(Thread):
             device_slug = f"{self._settings.ap_name}_{device_slug}"
 
         ok = True
-        if device_slug not in self._registered_clients:
-            self._registered_clients.add(device_slug)
+        with self._registration_lock:
+            needs_discovery = device_slug not in self._registered_clients
+            publish_epoch = self._registration_epoch
+        if needs_discovery:
             body = {
                 "state_topic": f"homeassistant/device_tracker/{device_slug}/state",
                 "json_attributes_topic": f"homeassistant/device_tracker/{device_slug}/state",
@@ -230,11 +244,25 @@ class PresenceDetector(Thread):
                 body = Settings.deep_merge(body, self._settings.params[device])
                 if "name" not in body["device"]:
                     body["device"]["name"] = body["name"]
-            # Register the device in HA
-            ok &= self._publish(
+            # Cache discovery only when the broker accepted the publish.
+            discovery_ok = self._publish(
                 f"homeassistant/device_tracker/{device_slug}/config", json.dumps(body)
             )
+            if discovery_ok:
+                with self._registration_lock:
+                    if publish_epoch == self._registration_epoch:
+                        self._registered_clients.add(device_slug)
+                    else:
+                        # A disconnect or resync invalidated this publish.
+                        # Return failure so the normal queue retries discovery.
+                        discovery_ok = False
+            ok &= discovery_ok
         # Set the state of the device
+        with self._registration_lock:
+            if publish_epoch != self._registration_epoch:
+                # A cached registration may have been cleared while this call
+                # was in progress; force discovery on the next queue retry.
+                return False
         state = {
             "in_zones": [f"zone.{self._settings.location}"] if seen else [],
             "state": self._settings.location if seen else self._settings.away,
@@ -245,6 +273,20 @@ class PresenceDetector(Thread):
             retain=self._settings.mqtt_retain_state,
         )
         return ok
+
+    def _queue_presence(
+        self, device: str, interface: str, action: QueueItem.Action
+    ) -> None:
+        """Enqueue a presence change, superseding older events for this MAC."""
+        with self._presence_lock:
+            revision = self._presence_revision.get(device, 0) + 1
+            self._presence_revision[device] = revision
+            self._queue.put(QueueItem(device, interface, action, revision))
+
+    def _is_current_presence(self, item: QueueItem) -> bool:
+        """Discard retry backlog entries superseded by a newer event."""
+        with self._presence_lock:
+            return self._presence_revision.get(item.device) == item.revision
 
     def set_device_away(self, interface: str, device: str) -> None:
         """Mark a client as away in HA"""
@@ -260,14 +302,14 @@ class PresenceDetector(Thread):
                     True,
                 )
                 return
-        self._queue.put(QueueItem(device, interface, QueueItem.Action.DELETE))
+        self._queue_presence(device, interface, QueueItem.Action.DELETE)
         self._logger.log(f"Device {device} on {interface} is now away")
 
     def set_device_home(self, interface: str, device: str) -> None:
         """Add client to the 'add' queue"""
         if not self._should_handle_device(device):
             return
-        self._queue.put(QueueItem(device, interface, QueueItem.Action.ADD))
+        self._queue_presence(device, interface, QueueItem.Action.ADD)
         self._online_clients[interface].add(device)
         self._logger.log(
             f"Device {device} on {interface} is now at {self._settings.location}"
@@ -330,7 +372,7 @@ class PresenceDetector(Thread):
 
     def _do_full_sync(self, away_only=False):
         """Perform a full sync of all current online devices compared to last time"""
-        self._registered_clients = set()
+        self._reset_registrations()
         seen_now = set(self._get_all_online_devices())
         is_first_sync = self._last_seen_clients is None
         away = (self._last_seen_clients or set()) - seen_now
@@ -357,7 +399,10 @@ class PresenceDetector(Thread):
                 # is keyed by real interface names and is only meaningful
                 # for devices that were actually observed on one, which by
                 # definition isn't the case here.
-                self._ha_seen(device, seen=False)
+                if not self._ha_seen(device, seen=False):
+                    # Offline configured devices receive no association events.
+                    # Retry failed discovery through the normal MQTT queue.
+                    self._queue_presence(device, "", QueueItem.Action.DELETE)
 
     def run(self) -> None:
         """Main loop for the presence detector"""
@@ -389,6 +434,12 @@ class PresenceDetector(Thread):
 
             if item.action == QueueItem.Action.SYNC:
                 self._do_full_sync()
+                self._queue.task_done()
+                continue
+
+            if not self._is_current_presence(item):
+                # An older failed publish must never overwrite the current
+                # retained MQTT state after a newer event has arrived.
                 self._queue.task_done()
                 continue
 
