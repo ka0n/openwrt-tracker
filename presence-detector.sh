@@ -291,7 +291,7 @@ ha_seen() {
 	if ! is_registered "$device_slug"; then
 		local config_topic="homeassistant/device_tracker/${device_slug}/config"
 		local state_topic="homeassistant/device_tracker/${device_slug}/state"
-		local body
+		local body=""
 
 		if [ "$HAS_UCODE" = "1" ]; then
 			# Full path: deep-merge the device's entire params block into the
