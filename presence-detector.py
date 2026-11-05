@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass
 from enum import IntEnum
 from queue import Queue
-from threading import Lock, Thread
+from threading import Lock, RLock, Thread
 from typing import Any, Callable
 
 from paho.mqtt import client as mqtt
@@ -127,14 +127,15 @@ class PresenceDetector(Thread):
         self._queue: Queue = Queue()
         self._watchers: list[UbusWatcher] = []
         self._killed = False
-        self._last_seen_clients: set[tuple[str, str]] | None = None
         self._online_clients: dict[str, set[str]] = {}
         self._registered_clients: set[str] = set()
         self._registration_lock = Lock()
         self._registration_epoch = 0
+        self._sync_pending = False
         # The most recently enqueued presence event wins after MQTT retries.
         self._presence_revision: dict[str, int] = {}
-        self._presence_lock = Lock()
+        self._presence_lock = RLock()
+        self._sync_events: dict[str, set[str]] | None = None
         for interface in self._settings.interfaces:
             self._online_clients[interface] = set()
         self._connect_to_mqtt()
@@ -177,6 +178,7 @@ class PresenceDetector(Thread):
             return
         self._logger.log("MQTT broker connected")
         self._mqtt.subscribe("homeassistant/status")
+        self._request_sync()
 
     def _on_mqtt_connect_fail(self, _client, _userdata):
         """Callback for MQTT connection failures"""
@@ -196,14 +198,24 @@ class PresenceDetector(Thread):
 
     def _on_ha_status_message(self, _client, _userdata, message):
         """Callback for HA status messages"""
+        if message.retain:
+            # The retained status delivered on subscription is historical.
+            # The connect callback has already requested a full sync.
+            return
         if message.payload == b"offline":
             self._logger.log("Home Assistant is offline!")
             self._reset_registrations()
         elif message.payload == b"online":
             self._logger.log("Home Assistant is back online")
-            # Don't sync here: this runs in paho's network thread, and an
-            # exception in it would end that thread for good (#106).
-            self._queue.put(QueueItem("sync", "", QueueItem.Action.SYNC))
+            self._request_sync()
+
+    def _request_sync(self) -> None:
+        # Callbacks run on Paho's network thread. Only the queue consumer
+        # may run a full sync or wait for a publish acknowledgement.
+        with self._registration_lock:
+            if not self._sync_pending:
+                self._sync_pending = True
+                self._queue.put(QueueItem("sync", "", QueueItem.Action.SYNC))
 
     def _publish(self, topic: str, data: str, retain=False) -> bool:
         self._logger.log(f"Publishing to {topic}: {data}", True)
@@ -217,7 +229,9 @@ class PresenceDetector(Thread):
             return False
         return result.is_published()
 
-    def _ha_seen(self, device: str, seen: bool = True) -> bool:
+    def _ha_seen(
+        self, device: str, seen: bool = True, item: QueueItem | None = None
+    ) -> bool:
         """Publish MQTT messages register the device and update home/away status"""
         device_slug = device_name = device.replace(":", "_")
         if self._settings.ap_name:
@@ -267,6 +281,11 @@ class PresenceDetector(Thread):
             "in_zones": [f"zone.{self._settings.location}"] if seen else [],
             "state": self._settings.location if seen else self._settings.away,
         }
+        # Discovery can block while a watcher records newer presence.
+        # An event arriving after this check can still race the MQTT send.
+        # The serial consumer will publish the newer revision afterwards.
+        if item is not None and not self._is_current_presence(item):
+            return True
         ok &= self._publish(
             f"homeassistant/device_tracker/{device_slug}/state",
             json.dumps(state),
@@ -292,32 +311,34 @@ class PresenceDetector(Thread):
         """Mark a client as away in HA"""
         if not self._should_handle_device(device):
             return
-        if device in self._online_clients[interface]:
-            self._online_clients[interface].remove(device)
-        for intf in set(self._settings.interfaces) - {interface}:
-            if device in self._online_clients[intf]:
-                # Device is still connected to another interface -> ignore
+        with self._presence_lock:
+            if self._sync_events is not None:
+                self._sync_events.setdefault(interface, set()).add(device)
+            self._online_clients[interface].discard(device)
+            if any(device in clients for clients in self._online_clients.values()):
                 self._logger.log(
-                    f"Device {device} still connected to {intf}, ignoring away event.",
-                    True,
+                    f"Device {device} is still connected, ignoring away", True
                 )
                 return
-        self._queue_presence(device, interface, QueueItem.Action.DELETE)
+            self._queue_presence(device, interface, QueueItem.Action.DELETE)
         self._logger.log(f"Device {device} on {interface} is now away")
 
     def set_device_home(self, interface: str, device: str) -> None:
         """Add client to the 'add' queue"""
         if not self._should_handle_device(device):
             return
-        self._queue_presence(device, interface, QueueItem.Action.ADD)
-        self._online_clients[interface].add(device)
+        with self._presence_lock:
+            if self._sync_events is not None:
+                self._sync_events.setdefault(interface, set()).add(device)
+            self._online_clients[interface].add(device)
+            self._queue_presence(device, interface, QueueItem.Action.ADD)
         self._logger.log(
             f"Device {device} on {interface} is now at {self._settings.location}"
         )
 
     def _get_all_online_devices(self) -> list[tuple[str, str]]:
         """Call ubus and get all online devices"""
-        devices = []
+        devices: list[tuple[str, str]] = []
         for interface in self._settings.interfaces:
             process = subprocess.run(
                 ["ubus", "call", interface, "get_clients"],
@@ -331,7 +352,7 @@ class PresenceDetector(Thread):
                 )
                 continue
             response: dict = json.loads(process.stdout)
-            devices.extend([(interface, key) for key in response["clients"].keys()])
+            devices.extend((interface, key.lower()) for key in response["clients"])
         return devices
 
     def _should_handle_device(self, device: str) -> bool:
@@ -370,48 +391,37 @@ class PresenceDetector(Thread):
         self._mqtt.disconnect()
         self._mqtt.loop_stop()
 
-    def _do_full_sync(self, away_only=False):
+    def _do_full_sync(self) -> None:
         """Perform a full sync of all current online devices compared to last time"""
         self._reset_registrations()
-        seen_now = set(self._get_all_online_devices())
-        is_first_sync = self._last_seen_clients is None
-        away = (self._last_seen_clients or set()) - seen_now
-        self._last_seen_clients = seen_now
-        for interface, client in seen_now:
-            if not away_only:
-                self.set_device_home(interface, client)
-        for interface, client in away:
-            self.set_device_away(interface, client)
-
-        if is_first_sync:
-            # First-sync fix for #81: without this, a params-listed device
-            # that's currently offline but was previously marked home via a
-            # retained MQTT message stays stuck home forever.
-            seen_macs = {client for _interface, client in seen_now}
-            for device in self._settings.params:
-                if device in seen_macs or not self._should_handle_device(device):
+        changed: dict[str, set[str]] = {}
+        with self._presence_lock:
+            self._sync_events = changed
+        snapshot = self._get_all_online_devices()
+        with self._presence_lock:
+            self._sync_events = None
+            previously_online = set().union(*self._online_clients.values())
+            # Preserve watcher updates received while querying ubus. Apply
+            # the rest of the snapshot across all interfaces before deciding
+            # who is away, so a roamed MAC is handled only once.
+            for interface, clients in self._online_clients.items():
+                clients.intersection_update(changed.get(interface, ()))
+            for interface, device in snapshot:
+                if device in changed.get(interface, ()):
                     continue
-                self._logger.log(
-                    f"Device {device} is away (first sync, no prior state)", True
-                )
-                # Call _ha_seen directly rather than set_device_away: the
-                # latter's per-interface bookkeeping (self._online_clients)
-                # is keyed by real interface names and is only meaningful
-                # for devices that were actually observed on one, which by
-                # definition isn't the case here.
-                if not self._ha_seen(device, seen=False):
-                    # Offline configured devices receive no association events.
-                    # Retry failed discovery through the normal MQTT queue.
+                if self._should_handle_device(device):
+                    self._online_clients[interface].add(device)
+            online = set().union(*self._online_clients.values())
+            for device in online:
+                self._queue_presence(device, "", QueueItem.Action.ADD)
+            for device in (previously_online | self._settings.params.keys()) - online:
+                if self._should_handle_device(device):
                     self._queue_presence(device, "", QueueItem.Action.DELETE)
 
     def run(self) -> None:
         """Main loop for the presence detector"""
-        self._do_full_sync()
-
-        # Start ubus watcher(s) for every interface
         self.start_watchers()
 
-        mq_is_offline = False
         # Enable a queue timeout if fallback_sync interval is set
         queue_timeout = (
             self._settings.fallback_sync_interval
@@ -433,6 +443,8 @@ class PresenceDetector(Thread):
                 break
 
             if item.action == QueueItem.Action.SYNC:
+                with self._registration_lock:
+                    self._sync_pending = False
                 self._do_full_sync()
                 self._queue.task_done()
                 continue
@@ -443,17 +455,13 @@ class PresenceDetector(Thread):
                 self._queue.task_done()
                 continue
 
-            if self._ha_seen(item.device, item.action == QueueItem.Action.ADD):
-                if mq_is_offline:
-                    # We're back online -> process backlog
-                    mq_is_offline = False
-                    self._do_full_sync()
-            else:
+            if not self._ha_seen(
+                item.device, item.action == QueueItem.Action.ADD, item
+            ):
                 self._logger.log("MQTT broker seems to be offline, sleeping...")
-                # MQTT is offline -> Add the item back to the queue
-                # and perform a full sync when it's back
+                # Retry the same revision. The MQTT connect callback
+                # requests a full sync when the connection comes back.
                 self._queue.put(item)
-                mq_is_offline = True
                 time.sleep(5)
 
             self._queue.task_done()

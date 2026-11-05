@@ -45,7 +45,8 @@ The behavior mirrors the Python version:
 * On start it performs a **full sync** via `ubus call <iface> get_clients` and
   publishes `home` for every connected client.
 * It runs one **`ubus subscribe <iface>`** watcher per Wi-Fi interface and
-  reacts to `assoc` (join) and `disassoc` (leave) events in realtime. When
+  queues `assoc` (join) and `disassoc` (leave) events for the main loop.
+  The loop checks for queued devices every two seconds. When
   `interfaces` is left empty (auto-detect), it also re-checks every 30s for
   radios that weren't up yet at startup (DFS CAC delay, slow boot, a wifi
   reload, or a renamed/renumbered interface after a channel switch or
@@ -73,9 +74,13 @@ The behavior mirrors the Python version:
   [#67](https://github.com/rmoesbergen/openwrt-ha-device-tracker/issues/67)
   and [#50](https://github.com/rmoesbergen/openwrt-ha-device-tracker/issues/50).
 
-Registration state (which devices have already had their discovery config
-published) is tracked with marker files under `/var/run/presence-detector/`,
-so the asynchronous watchers and the main loop share state without threads.
+The main loop publishes from a fresh hostapd snapshot across all interfaces.
+Work that fails is retried every 30 seconds and survives a service restart as
+long as `/var/run/presence-detector/` is preserved. A failed publish clears the
+registration cache so the retry can restore discovery and state together.
+For an idle broker restart that produces neither a failed publish nor an HA
+status notification, enable `fallback_sync_interval` to re-announce devices
+periodically.
 
 ## Installation
 

@@ -18,7 +18,6 @@ class PresenceBacklogTest(unittest.TestCase):
         detector._presence_lock = Lock()
         detector._settings = SimpleNamespace(fallback_sync_interval=0)
         detector._logger = SimpleNamespace(log=lambda *args, **kwargs: None)
-        detector._do_full_sync = lambda: None
         detector.start_watchers = lambda: None
 
         mac = "aa:bb:cc:dd:ee:ff"
@@ -27,7 +26,7 @@ class PresenceBacklogTest(unittest.TestCase):
         attempted = []
         published = []
 
-        def publish(device, seen):
+        def publish(device, seen, item):
             attempted.append(seen)
             if len(attempted) == 1:
                 # During the failed HOME publish, the device leaves.

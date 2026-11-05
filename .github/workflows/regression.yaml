@@ -7,6 +7,7 @@ on:
   pull_request:
     branches:
       - 'upstream-main-*'
+      - 'fix/verify-presence-retry-2026-11'
       - main
   workflow_dispatch:
 
@@ -16,6 +17,7 @@ permissions:
 jobs:
   regression:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,11 +26,9 @@ jobs:
       - name: Install MQTT integration test dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq mosquitto
+          sudo apt-get install -y -qq busybox mosquitto mosquitto-clients
           python -m pip install -r requirements-dev.txt
-      - name: Real MQTT broker restart integration test
-        run: python -m unittest discover -s tests -p 'test_real_mqtt_broker.py' -v
-      - name: Python syntax and unit tests
+      - name: Python syntax, unit tests and MQTT integration tests
         run: |
           python -m compileall -q presence-detector.py tests
           python -m unittest discover -s tests -p 'test_*.py' -v
@@ -40,9 +40,7 @@ jobs:
         run: |
           pylint presence-detector.py
           mypy presence-detector.py
-      - name: Shell syntax and unit tests
+      - name: BusyBox shell syntax and regression tests
         run: |
-          sh -n presence-detector.sh
-          if [ -f tests/test_shell_discovery_retry.sh ]; then
-            sh tests/test_shell_discovery_retry.sh presence-detector.sh
-          fi
+          busybox ash -n presence-detector.sh
+          busybox ash tests/test_shell_discovery_retry.sh presence-detector.sh
