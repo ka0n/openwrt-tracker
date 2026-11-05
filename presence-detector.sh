@@ -137,8 +137,8 @@ mqtt_pub() {
 # Registration state
 # ---------------------------------------------------------------------------
 # We track which device slugs have already been registered (config published)
-# with marker files in a tmpfs runtime dir, so the async ubus watchers and the
-# main process share state without needing threads.
+# with marker files in a tmpfs runtime dir. Only the main loop publishes or
+# changes these registrations. Watchers request work via marker files.
 
 RUNDIR="/var/run/presence-detector"
 LAST_SEEN="/var/run/presence-detector.last_seen"
@@ -182,9 +182,13 @@ mark_pending_away() {
 	# mark_pending_away <device_slug> <mac>
 	# Written via a temp file + rename so the main loop never reads a
 	# half-written marker.
-	local marker="$RUNDIR/$1.pending_away"
-	echo "$(( $(date +%s) + AWAY_DEBOUNCE_SECONDS )) $2" > "$marker.tmp" 2>/dev/null &&
-		mv "$marker.tmp" "$marker" 2>/dev/null
+	local marker="$RUNDIR/$1.pending_away" tmp
+	tmp=$(mktemp "$marker.XXXXXX") || return 1
+	if ! echo "$(( $(date +%s) + AWAY_DEBOUNCE_SECONDS )) $2" > "$tmp" ||
+		! mv "$tmp" "$marker"; then
+		rm -f "$tmp"
+		return 1
+	fi
 }
 
 clear_pending_away() {
@@ -206,14 +210,14 @@ process_pending_away() {
 			continue
 			;;
 		esac
-		[ -n "$mac" ] || { rm -f "$marker"; continue; }
+		is_mac "$mac" || { rm -f "$marker"; continue; }
 		[ "$now" -ge "$deadline" ] || continue
 		# Claim the marker atomically: if an assoc just removed it, the mv
 		# fails and we must not publish away.
 		mv "$marker" "$marker.claimed" 2>/dev/null || continue
 		rm -f "$marker.claimed"
-		log "Device $mac is now away (debounced)" 1
-		ha_seen "$mac" 0
+		log "Rechecking device $mac after away debounce" 1
+		queue_presence "$mac"
 	done
 }
 
@@ -254,23 +258,35 @@ device_slug() {
 }
 
 # ---------------------------------------------------------------------------
-# JSON escaping for params passthrough
+# Presence work and MQTT publication (main loop owns all publications)
 # ---------------------------------------------------------------------------
 
-# Publish the discovery config + state for a device.
-# ha_seen <device-mac> <seen: 1|0> [discovery-only: 1]
-# Idle retries must not replay an obsolete presence state after a newer event.
-ha_seen() {
-	local device="$1"
-	local seen="$2"
-	local discovery_only="${3:-0}"
+is_mac() {
+	case "$1" in
+	[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) return 0 ;;
+	*) return 1 ;;
+	esac
+}
 
-	local device_name
-	local device_slug
+queue_presence() {
+	# A dirty MAC is enough: resolve its state across all interfaces after
+	# taking the marker. Watchers never wait for MQTT or replay event payloads.
+	touch "$RUNDIR/$1.presence"
+}
+
+registration_reset_pending() {
+	[ -f "$RUNDIR/.reset_registrations" ]
+}
+
+# Publish discovery and state for a MAC from the current hostapd snapshot.
+# Return success only if both are ready and no reset invalidated the work.
+ha_seen() {
+	local device="$1" seen="$2" ok=0
+	local device_name device_slug
 	device_name=$(echo "$device" | tr ':' '_')
 	device_slug=$(device_slug "$device")
 
-	local ok=0
+	[ ! -f "$RUNDIR/$device.presence" ] && ! registration_reset_pending || return 1
 
 	if ! is_registered "$device_slug"; then
 		local config_topic="homeassistant/device_tracker/${device_slug}/config"
@@ -348,29 +364,16 @@ ha_seen() {
 		# own reconnect.
 		mqtt_pub "$config_topic" "$body" 1
 		ok=$?
-		if [ "$ok" -eq 0 ]; then
-			mark_registered "$device_slug"
-			rm -f "$RUNDIR/$device_slug.discovery_retry"
-		else
-			# Persist failed discovery even if this device emits no more events.
-			# Use rename so the main loop never sees a half-written file.
-			local retry_file="$RUNDIR/$device_slug.discovery_retry"
-			local retry_tmp
-			retry_tmp=$(mktemp "$retry_file.XXXXXX") || return 1
-			if printf '%s %s\n' "$device" "$seen" > "$retry_tmp"; then
-				mv "$retry_tmp" "$retry_file"
-			else
-				rm -f "$retry_tmp"
-				return 1
-			fi
+		if [ "$ok" -ne 0 ]; then
+			reset_registrations
+		elif ! registration_reset_pending; then
+			mark_registered "$device_slug" || return 1
 		fi
-	else
-		# Another watcher may already have completed discovery for this MAC.
-		rm -f "$RUNDIR/$device_slug.discovery_retry"
 	fi
 
-	# A retry repairs discovery only; live events own presence state.
-	[ "$discovery_only" = "1" ] && return "$ok"
+	# A watcher may have observed a new event during a blocking publish.
+	# Leave the work pending so the next pass takes a fresh snapshot.
+	[ ! -f "$RUNDIR/$device.presence" ] && ! registration_reset_pending || return 1
 
 	# Publish state
 	local state_topic="homeassistant/device_tracker/${device_slug}/state"
@@ -383,136 +386,142 @@ ha_seen() {
 
 	local retain=0
 	[ "$MQTT_RETAIN_STATE" = "true" ] && retain=1
-	mqtt_pub "$state_topic" "$state_payload" "$retain"
-	ok=$((ok + $?))
-
-	return $ok
+	if ! mqtt_pub "$state_topic" "$state_payload" "$retain"; then
+		# A broken connection can also mean the broker lost discovery.
+		reset_registrations
+		return 1
+	fi
+	[ "$ok" -eq 0 ] && ! registration_reset_pending
 }
 
 # ---------------------------------------------------------------------------
-# Idle discovery retry
-# ---------------------------------------------------------------------------
-
-retry_failed_discoveries() {
-	# Called by main every 30s, even with fallback_sync_interval=0.
-	# Retry the failed device directly, including named offline devices;
-	# a full sync alone could omit previously seen but now-away clients.
-	local retry_file mac seen
-	for retry_file in "$RUNDIR"/*.discovery_retry; do
-		[ -f "$retry_file" ] || continue
-		read -r mac seen < "$retry_file" || continue
-		case "$seen" in
-		0|1) ha_seen "$mac" "$seen" 1 || : ;;
-		*) rm -f "$retry_file" ;;
-		esac
-	done
-}
-
-# ---------------------------------------------------------------------------
-# Full sync
+# Snapshot, sync and retry
 # ---------------------------------------------------------------------------
 
 get_all_online_devices() {
-	# Prints "interface mac" pairs for every currently connected client.
-	local interface
+	# Prints "interface mac" pairs and reports whether the scan was complete.
+	local interface response clients mac status=0
 	for interface in $INTERFACES; do
-		ubus call "$interface" get_clients 2>/dev/null | \
-			grep -o '"[0-9a-fA-F:]\{17\}"' | tr -d '"' | tr 'A-Z' 'a-z' | \
-			sort -u | \
-			while read -r mac; do
-				[ -n "$mac" ] && echo "$interface $mac"
+		response=$(ubus call "$interface" get_clients 2>/dev/null)
+		case "$?" in
+		0) ;;
+		4) continue ;; # UBUS_STATUS_NOT_FOUND: hostapd object is gone.
+		*) status=1; continue ;;
+		esac
+		if ! clients=$(jsonfilter -s "$response" -e '@.clients'); then
+			status=1
+			continue
+		fi
+		echo "$clients" | grep -oE '"[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}"' |
+			tr -d '"' | tr 'A-Z' 'a-z' | while read -r mac; do
+				echo "$interface $mac"
 			done
 	done
+	return "$status"
+}
+
+restore_retries() {
+	# Upgrade the old marker format. Only the MAC is useful after restart.
+	local marker mac
+	for marker in "$RUNDIR"/*.discovery_retry; do
+		[ -f "$marker" ] || continue
+		if read -r mac _ < "$marker" && is_mac "$mac" && should_handle_device "$mac"; then
+			queue_presence "$mac" || continue
+		fi
+		rm -f "$marker"
+	done
+	rm -f "$RUNDIR"/*.discovery_retry.*
+}
+
+process_presence() {
+	# Take new requests before reading hostapd. A watcher writing a new
+	# marker after the rename leaves it for the next pass. Keep the claimed
+	# marker until both MQTT publishes succeed, including across restarts.
+	local sync="$1" retry="$2" marker mac devices='' complete=1
+	for marker in "$RUNDIR"/*.presence; do
+		[ -f "$marker" ] || continue
+		mac=${marker##*/}
+		mac=${mac%.presence}
+		mv -f "$marker" "$RUNDIR/$mac.presence_retry" || continue
+		devices="$devices $mac"
+	done
+	if [ "$retry" = "1" ]; then
+		for marker in "$RUNDIR"/*.presence_retry; do
+			[ -f "$marker" ] || continue
+			mac=${marker##*/}
+			devices="$devices ${mac%.presence_retry}"
+		done
+	fi
+	[ -n "$devices" ] || [ "$sync" = "1" ] || return 0
+
+	local seen_file="$RUNDIR/.seen_now" now_macs seen
+	get_all_online_devices > "$seen_file" || complete=0
+	now_macs=$(awk '{print $2}' "$seen_file")
+	if [ "$sync" = "1" ]; then
+		devices="$devices $now_macs"
+		if [ -f "$LAST_SEEN" ]; then
+			devices="$devices $(awk '{print $2}' "$LAST_SEEN")"
+		fi
+		devices="$devices $(jsonfilter -i "$CONFIG" -e '@.params' 2>/dev/null |
+			grep -oE '"[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}"' | tr -d '"' | tr 'A-Z' 'a-z')"
+	fi
+	for mac in $(printf '%s\n' "$devices" | awk '{for (i=1; i<=NF; i++) print $i}' | sort -u); do
+		[ ! -f "$RUNDIR/.stop" ] || return 0
+		marker="$RUNDIR/$mac.presence_retry"
+		if ! is_mac "$mac" || ! should_handle_device "$mac"; then
+			rm -f "$marker"
+			continue
+		fi
+		touch "$marker" || continue
+		seen=0
+		if printf '%s\n' "$now_macs" | grep -Fxq "$mac"; then
+			seen=1
+		elif [ "$complete" = "0" ] || [ -f "$RUNDIR/$(device_slug "$mac").pending_away" ]; then
+			# Unknown or still being debounced. Keep the retry marker.
+			continue
+		fi
+		if ha_seen "$mac" "$seen"; then
+			rm -f "$marker"
+		fi
+	done
+	# Preserve the old snapshot if ubus did not answer on every interface.
+	if [ "$sync" = "1" ] && [ "$complete" = "1" ]; then
+		mv -f "$seen_file" "$LAST_SEEN"
+	fi
 }
 
 do_full_sync() {
-	# Re-register everything and publish current state for all online devices.
-	#
-	# force=1 bypasses the debounce below. Used when we know we may have
-	# missed events (e.g. a watcher just reconnected after an unexpected
-	# drop) and a "we synced recently" skip would be wrong here specifically.
-	local force="${1:-0}"
-
-	# Debounce: the retained homeassistant/status "online" message is
-	# delivered immediately after startup (right after main's own sync) and on
-	# every mosquitto_sub reconnect. Without this guard those would each
-	# trigger a redundant full re-sync. Skip if we synced < 30s ago.
-	local now
-	now=$(date +%s 2>/dev/null || echo 0)
+	# Debounce retained HA online notifications. Watcher recovery and
+	# startup request a forced sync even inside this window.
+	local force="$1" now last
+	now=$(date +%s)
 	if [ "$force" != "1" ] && [ -f "$RUNDIR/.last_sync" ]; then
-		local last
-		last=$(cat "$RUNDIR/.last_sync" 2>/dev/null || echo 0)
-		if [ "$now" -gt 0 ] && [ "$last" -gt 0 ] && [ $((now - last)) -lt 30 ]; then
+		read -r last < "$RUNDIR/.last_sync"
+		if [ $((now - last)) -lt 30 ]; then
 			log "Skipping redundant full sync (last was $((now - last))s ago)" 1
-			return 0
+			return 1
 		fi
 	fi
-	echo "$now" > "$RUNDIR/.last_sync" 2>/dev/null
-
+	echo "$now" > "$RUNDIR/.last_sync"
 	reset_registrations
-	local seen_file="$RUNDIR/.seen_now"
-	get_all_online_devices | sort -u > "$seen_file"
+	process_presence 1 1
+	return 0
+}
 
-	# Publish 'home' for everything currently online.
-	while read -r interface mac; do
-		[ -z "$mac" ] && continue
-		if should_handle_device "$mac"; then
-			ha_seen "$mac" 1
-			log "Device $mac on $interface is now at $LOCATION" 1
-		fi
-	done < "$seen_file"
-
-	# Away detection has two complementary parts, and BOTH run on every sync
-	# (not just the first):
-	#
-	#  1. Diff against LAST_SEEN: any MAC we saw online last time but isn't
-	#     online now is away. This catches arbitrary devices - including ones
-	#     not listed in params - but only if we actually observed them here
-	#     before (they made it into a prior snapshot).
-	#
-	#  2. Proactively check every params-listed MAC: if a known, named device
-	#     isn't online right now, publish it away. This is the ONLY thing that
-	#     catches a device that silently disappeared without ever emitting a
-	#     disassoc (common on iOS) AND was never in LAST_SEEN to diff against -
-	#     e.g. it dropped off before the last service restart cleared the
-	#     snapshot, or only ever connected to a different AP. Without this, a
-	#     stale RETAINED "home" state for such a device sits in HA forever,
-	#     since nothing ever tells HA otherwise (see the celu-de-cecilia
-	#     incident; same class as upstream #51 / #84).
-	#
-	# ha_seen "$mac" 0 publishes a retained "not_home" and is idempotent, so a
-	# MAC caught by both parts just gets the same message twice - harmless.
-	local now_macs
-	now_macs=$(awk '{print $2}' "$seen_file" | sort -u)
-
-	# Part 1: LAST_SEEN diff (only possible once we have history).
-	if [ -f "$LAST_SEEN" ]; then
-		# Compare on the MAC column only (a device may roam interfaces).
-		awk '{print $2}' "$LAST_SEEN" | sort -u | while read -r mac; do
-			[ -z "$mac" ] && continue
-			if ! echo "$now_macs" | grep -qx "$mac"; then
-				if should_handle_device "$mac"; then
-					ha_seen "$mac" 0
-					log "Device $mac is now away" 1
-				fi
-			fi
-		done
+process_sync_requests() {
+	if [ -f "$RUNDIR/.reset_registrations" ]; then
+		rm -f "$RUNDIR/.reset_registrations" "$RUNDIR/.last_sync"
+		reset_registrations
 	fi
-
-	# Part 2: every params-listed MAC that isn't online right now.
-	jsonfilter -i "$CONFIG" -e '@.params' 2>/dev/null | \
-		grep -oE '"[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}"' | tr -d '"' | tr 'A-Z' 'a-z' | sort -u | \
-		while read -r mac; do
-			[ -z "$mac" ] && continue
-			if ! echo "$now_macs" | grep -qx "$mac"; then
-				if should_handle_device "$mac"; then
-					ha_seen "$mac" 0
-					log "Device $mac is away (params-listed, not currently online)" 1
-				fi
-			fi
-		done
-
-	cp "$seen_file" "$LAST_SEEN"
+	if [ -f "$RUNDIR/.force_sync" ]; then
+		rm -f "$RUNDIR/.force_sync" "$RUNDIR/.full_sync"
+		do_full_sync 1
+	elif [ -f "$RUNDIR/.full_sync" ]; then
+		rm -f "$RUNDIR/.full_sync"
+		do_full_sync 0
+	else
+		return 1
+	fi
 }
 
 # ---------------------------------------------------------------------------
@@ -538,7 +547,7 @@ watch_interface() {
 				local mac
 				mac=$(echo "$line" | grep -o '"address":"[^"]*"' | \
 					head -n1 | cut -d'"' -f4 | tr 'A-Z' 'a-z')
-				[ -z "$mac" ] && continue
+				is_mac "$mac" || continue
 				if should_handle_device "$mac"; then
 					# Cancel any pending debounced "away" for this device -
 					# it just reappeared (same interface, another interface
@@ -546,14 +555,14 @@ watch_interface() {
 					# the main loop must find no marker and do nothing.
 					clear_pending_away "$(device_slug "$mac")"
 					log "Device $mac on $interface is now at $LOCATION" 1
-					ha_seen "$mac" 1
+					queue_presence "$mac"
 				fi
 				;;
 			*'"disassoc"'*)
 				local mac
 				mac=$(echo "$line" | grep -o '"address":"[^"]*"' | \
 					head -n1 | cut -d'"' -f4 | tr 'A-Z' 'a-z')
-				[ -z "$mac" ] && continue
+				is_mac "$mac" || continue
 				if should_handle_device "$mac"; then
 					if [ "$AWAY_DEBOUNCE_SECONDS" -gt 0 ] 2>/dev/null; then
 						# The main loop publishes "away" once the deadline
@@ -562,7 +571,7 @@ watch_interface() {
 						log "Device $mac on $interface disassociated; debouncing ${AWAY_DEBOUNCE_SECONDS}s before marking away" 1
 					else
 						log "Device $mac on $interface is now away" 1
-						ha_seen "$mac" 0
+						queue_presence "$mac"
 					fi
 				fi
 				;;
@@ -596,7 +605,7 @@ watch_interface() {
 			# force=1 bypasses the redundant-sync debounce, which would
 			# otherwise silently swallow exactly the sync we need if this
 			# reconnect happens soon after any other sync.
-			do_full_sync 1
+			touch "$RUNDIR/.force_sync"
 			sleep 5
 		else
 			consecutive_quick_fails=$((consecutive_quick_fails + 1))
@@ -634,11 +643,11 @@ watch_ha_status() {
 			case "$payload" in
 			offline)
 				log "Home Assistant is offline!"
-				reset_registrations
+				touch "$RUNDIR/.reset_registrations"
 				;;
 			online)
 				log "Home Assistant is back online"
-				do_full_sync
+				touch "$RUNDIR/.full_sync"
 				;;
 			esac
 		done
@@ -711,16 +720,14 @@ main() {
 	# .debounce_pids is from older versions that backgrounded a sleep per
 	# disassoc.
 	rm -f "$RUNDIR"/*.pending_away "$RUNDIR"/*.pending_away.* "$RUNDIR/.debounce_pids" 2>/dev/null
-	# Failed publications from a killed instance cannot be trusted; startup
-	# full sync recreates retry markers for any new failures.
-	rm -f "$RUNDIR"/*.discovery_retry "$RUNDIR"/*.discovery_retry.* 2>/dev/null
-	reset_registrations
+	restore_retries
+	rm -f "$RUNDIR/.reset_registrations" "$RUNDIR/.force_sync" "$RUNDIR/.full_sync"
 	trap cleanup TERM INT
 
 	log "Starting presence-detector on interfaces: $INTERFACES"
 
-	# Initial full sync
-	do_full_sync
+	# Rebuild registrations and retry unfinished work from fresh hostapd data.
+	do_full_sync 1
 
 	CHILD_PIDS=""
 
@@ -735,8 +742,8 @@ main() {
 		CHILD_PIDS="$CHILD_PIDS $!"
 	done
 
-	# Main loop. With a fallback interval, periodically re-sync. Without one,
-	# just block so the main process stays in the foreground for procd.
+	# Main loop owns discovery, state publication and retry. Watchers only
+	# signal work and can continue reading while a publish blocks.
 	#
 	# NOTE: we deliberately do NOT use "sleep N & wait $!" here. When the
 	# background watcher children exit/respawn they deliver SIGCHLD, which
@@ -748,15 +755,15 @@ main() {
 	# .stop flag, and we exit on the next tick and run cleanup — without
 	# depending on a SIGTERM trap interrupting a long `sleep` (unreliable on
 	# busybox ash), and well within procd's term_timeout.
-	local elapsed=0
-	local retry_elapsed=0
+	local elapsed=0 retry_elapsed=0 retry
 	while [ ! -f "$RUNDIR/.stop" ]; do
 		sleep 2
 		[ -f "$RUNDIR/.stop" ] && break
+		retry=0
 		retry_elapsed=$((retry_elapsed + 2))
 		if [ "$retry_elapsed" -ge 30 ]; then
 			retry_elapsed=0
-			retry_failed_discoveries
+			retry=1
 		fi
 		if [ "$AWAY_DEBOUNCE_SECONDS" -gt 0 ] 2>/dev/null; then
 			process_pending_away
@@ -765,10 +772,10 @@ main() {
 			elapsed=$((elapsed + 2))
 			if [ "$elapsed" -ge "$FALLBACK_SYNC_INTERVAL" ]; then
 				elapsed=0
-				[ -f "$RUNDIR/.stop" ] && break
-				do_full_sync
+				touch "$RUNDIR/.full_sync"
 			fi
 		fi
+		process_sync_requests || process_presence 0 "$retry"
 	done
 
 	cleanup
