@@ -122,7 +122,6 @@ class RealBrokerRecoveryTest(unittest.TestCase):
                     "mqtt_port": self.port,
                     "mqtt_username": "",
                     "interfaces": [INTERFACE],
-                    "params": {MAC: {}},
                     "fallback_sync_interval": 0,
                     # Observe live state publishes, not an older retained value.
                     "mqtt_retain_state": False,

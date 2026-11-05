@@ -135,7 +135,7 @@ class PresenceDetector(Thread):
         # The most recently enqueued presence event wins after MQTT retries.
         self._presence_revision: dict[str, int] = {}
         self._presence_lock = RLock()
-        self._sync_events: set[str] | None = None
+        self._sync_events: dict[str, set[str]] | None = None
         for interface in self._settings.interfaces:
             self._online_clients[interface] = set()
         self._connect_to_mqtt()
@@ -313,7 +313,7 @@ class PresenceDetector(Thread):
             return
         with self._presence_lock:
             if self._sync_events is not None:
-                self._sync_events.add(device)
+                self._sync_events.setdefault(interface, set()).add(device)
             self._online_clients[interface].discard(device)
             if any(device in clients for clients in self._online_clients.values()):
                 self._logger.log(
@@ -329,7 +329,7 @@ class PresenceDetector(Thread):
             return
         with self._presence_lock:
             if self._sync_events is not None:
-                self._sync_events.add(device)
+                self._sync_events.setdefault(interface, set()).add(device)
             self._online_clients[interface].add(device)
             self._queue_presence(device, interface, QueueItem.Action.ADD)
         self._logger.log(
@@ -394,7 +394,7 @@ class PresenceDetector(Thread):
     def _do_full_sync(self) -> None:
         """Perform a full sync of all current online devices compared to last time"""
         self._reset_registrations()
-        changed: set[str] = set()
+        changed: dict[str, set[str]] = {}
         with self._presence_lock:
             self._sync_events = changed
         snapshot = self._get_all_online_devices()
@@ -404,10 +404,12 @@ class PresenceDetector(Thread):
             # Preserve watcher updates received while querying ubus. Apply
             # the rest of the snapshot across all interfaces before deciding
             # who is away, so a roamed MAC is handled only once.
-            for clients in self._online_clients.values():
-                clients.intersection_update(changed)
+            for interface, clients in self._online_clients.items():
+                clients.intersection_update(changed.get(interface, ()))
             for interface, device in snapshot:
-                if device not in changed and self._should_handle_device(device):
+                if device in changed.get(interface, ()):
+                    continue
+                if self._should_handle_device(device):
                     self._online_clients[interface].add(device)
             online = set().union(*self._online_clients.values())
             for device in online:

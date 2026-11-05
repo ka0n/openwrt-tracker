@@ -233,6 +233,25 @@ class DiscoveryRetryTest(unittest.TestCase):
         )
         self.assertEqual(detector._online_clients[interface], {mac})
 
+    def test_disassoc_during_scan_keeps_new_interface_from_snapshot(self):
+        mod, detector = self.make_detector()
+        old, new, mac = "hostapd.test", "hostapd.other", "aa:bb:cc:dd:ee:ff"
+        detector._online_clients[old] = {mac}
+        detector._online_clients[new] = set()
+
+        def snapshot():
+            detector.set_device_away(old, mac)
+            return [(old, mac), (new, mac)]
+
+        detector._get_all_online_devices = snapshot
+        detector._do_full_sync()
+        away = detector._queue.get_nowait()
+        home = detector._queue.get_nowait()
+        self.assertFalse(detector._is_current_presence(away))
+        self.assertTrue(detector._is_current_presence(home))
+        self.assertEqual(home.action, mod.QueueItem.Action.ADD)
+        self.assertEqual(detector._online_clients, {old: set(), new: {mac}})
+
 
 if __name__ == "__main__":
     unittest.main()
